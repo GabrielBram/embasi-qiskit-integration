@@ -158,11 +158,27 @@ class EmbeddingWorkflow(BaseSettings):
     # block (Claudino & Mayhall, doi:10.1021/acs.jctc.9b00682) so each rotated virtual
     # carries a definite fragment weight σ², then cuts on the σ² gap -- basis invariant,
     # robust when the canonical virtuals delocalise.  ``none`` disables.
-    selector: Literal["none", "mulliken", "spade", "concentric-cl"] = "concentric-cl"
-    # ``concentric-cl`` only: number of Fock shell expansions after shell 0.  0 keeps
-    # just the fragment-spanned shell (single-shell equivalent); higher values grow the
-    # active-virtual space (and the qubit/determinant count) for accuracy.
+    # ``apc-concentric``: concentric localization (locality pre-filter) followed by
+    # APC (King & Gagliardi, doi:10.1021/acs.jctc.1c00037) ranking + truncation of
+    # BOTH occupied and virtual candidates -- the only selector that can freeze
+    # occupied orbitals itself, so it supersedes ``n_frozen_occ``.  See
+    # ``ProjectionEmbeddingAdapter.build_orbitals_apc_concentric``.
+    selector: Literal["none", "mulliken", "spade", "concentric-cl", "apc-concentric"] = (
+        "concentric-cl"
+    )
+    # ``concentric-cl``/``apc-concentric`` only: number of Fock shell expansions
+    # after shell 0.  0 keeps just the fragment-spanned shell (single-shell
+    # equivalent); higher values grow the active-virtual candidate space (and the
+    # qubit/determinant count) for accuracy.
     n_shells: int = 0
+    # ``apc-concentric`` only: APC's active-space budget, as (nelec, norb).  Required
+    # when selector="apc-concentric"; inert otherwise.
+    apc_max_size: tuple[int, int] | None = None
+    # ``apc-concentric`` only: pin the selection to exactly apc_max_size every outer-
+    # loop cycle (recommended -- see build_orbitals_apc_concentric's stability note)
+    # rather than dynamically dropping to an N_CSF budget, which can change the
+    # active-space size cycle to cycle as F_emb drifts under density feedback.
+    apc_fixed: bool = True
     # How the active atoms partition into PHYSICAL fragments, as consecutive
     # counts in the order they appear in ``active_atoms`` (which the reorder keeps
     # leading, ascending).  ``None`` (default) -> one fragment (current behaviour).
@@ -253,9 +269,11 @@ class EmbeddingWorkflow(BaseSettings):
         # WF-in-DFT only.  Collective on every rank: EmbASI's supersystem SCF,
         # SPADE/Pipek-Mezey localisation, and the embedded Fock all run in here.
         emb.run_low_level()
-        selector, virtual_localizer = self._build_selector(emb, log=log)
+        selector, virtual_localizer, orbital_builder = self._build_selector(emb, log=log)
         solver = self._build_solver()
-        return self._run_outer_loop(emb, solver, selector, virtual_localizer, rank=rank, log=log)
+        return self._run_outer_loop(
+            emb, solver, selector, virtual_localizer, orbital_builder, rank=rank, log=log
+        )
 
     def _is_dft_in_dft(self) -> bool:
         """True when the high level is a density functional (-> paper Eq. 2).
@@ -296,7 +314,9 @@ class EmbeddingWorkflow(BaseSettings):
         return energy
 
     # ---------------- outer self-consistency loop ---------------- #
-    def _run_outer_loop(self, emb, solver, selector, virtual_localizer=None, *, rank, log):
+    def _run_outer_loop(
+        self, emb, solver, selector, virtual_localizer=None, orbital_builder=None, *, rank, log
+    ):
         """Steps 2-5, iterated until self-consistent (or ``max_cycles``).
 
         ``max_cycles == 1`` reproduces the single-pass flow exactly.  With more
@@ -319,6 +339,13 @@ class EmbeddingWorkflow(BaseSettings):
         density is linearly mixed with the previous one -- ``--mix_alpha`` ∈ (0, 1],
         the fraction of the new density (``1.0`` is undamped).  ``0.5`` converges
         max|Δγ^A| monotonically to ~1e-7 here; smaller is safer but slower.
+
+        ``orbital_builder`` (set only for ``selector="apc-concentric"``) bypasses
+        ``emb.build_orbitals(selector=..., virtual_localizer=...)`` entirely: APC's
+        two-stage construction (CL locality pre-filter, then APC ranks and
+        truncates occupied + virtual together) calls ``build_orbitals`` itself and
+        returns the finished ``EmbeddedOrbitals``, so ``selector``/
+        ``virtual_localizer`` are both ``None`` whenever this is set.
         """
         prev_total: float | None = None
         prev_dm_a = None
@@ -329,14 +356,24 @@ class EmbeddingWorkflow(BaseSettings):
             tag = "" if self.max_cycles == 1 else f" [cycle {cycle + 1}/{self.max_cycles}]"
 
             log(f"== Step 2: build subsystem-A orbitals and downfold =={tag}")
-            orbitals = emb.build_orbitals(
-                n_frozen_occ=self.n_frozen_occ,
-                n_virtual=self.n_virtual,
-                selector=selector,
-                virtual_localizer=virtual_localizer,
-            )
+            if orbital_builder is not None:
+                orbitals = orbital_builder(emb)
+            else:
+                orbitals = emb.build_orbitals(
+                    n_frozen_occ=self.n_frozen_occ,
+                    n_virtual=self.n_virtual,
+                    selector=selector,
+                    virtual_localizer=virtual_localizer,
+                )
             log(f"   {orbitals}")
-            if selector is not None or virtual_localizer is not None:
+            if orbital_builder is not None:
+                n_kept_virt = orbitals.n_active_orbitals - (orbitals.n_occ - orbitals.inactive.size)
+                log(
+                    f"   selector=apc-concentric picked {n_kept_virt} virtuals and froze "
+                    f"{orbitals.inactive.size} occupied (max_size={self.apc_max_size}, "
+                    f"fixed={self.apc_fixed})"
+                )
+            elif selector is not None or virtual_localizer is not None:
                 n_kept_virt = orbitals.n_active_orbitals - (orbitals.n_occ - orbitals.inactive.size)
                 budget = "" if self.n_virtual is None else f" (cap {self.n_virtual})"
                 log(
@@ -500,25 +537,30 @@ class EmbeddingWorkflow(BaseSettings):
     def _build_selector(self, emb: ProjectionEmbeddingAdapter, *, log=None):
         """Build the active-virtual shaping hook from ``self.selector``.
 
-        Returns a ``(selector, virtual_localizer)`` pair with at most one non-None
-        (both ``None`` for the fixed ``--n_virtual`` cut):
+        Returns a ``(selector, virtual_localizer, orbital_builder)`` triple with at
+        most one non-None (all ``None`` for the fixed ``--n_virtual`` cut):
 
         * ``mulliken`` -> a ``Selector`` (per-fragment single-shell Mulliken cut),
         * ``spade`` -> a ``VirtualLocalizer`` (SPADE rotation + σ² gap cut),
         * ``concentric-cl`` -> a ``VirtualLocalizer`` (iterative CL, ``n_shells``),
-        * ``none`` -> ``(None, None)``.
+        * ``apc-concentric`` -> an ``orbital_builder`` (``emb -> EmbeddedOrbitals``):
+          CL locality pre-filter then APC ranking, see
+          ``ProjectionEmbeddingAdapter.build_orbitals_apc_concentric``,
+        * ``none`` -> ``(None, None, None)``.
 
         A rotation cannot be expressed as a column-index ``Selector``, so ``spade``
         and ``concentric-cl`` go through the ``build_orbitals(virtual_localizer=...)``
         hook instead, anchored on the fragment UNION (a rotation cannot be unioned
-        per-fragment the way index selection can).
+        per-fragment the way index selection can); ``apc-concentric`` needs a full
+        ``EmbeddedOrbitals`` (it calls ``build_orbitals`` itself, then re-selects),
+        so it returns a third kind of hook the caller invokes directly on ``emb``.
 
         After the atom reorder in ``_build_adapter`` the region-1 (active) atoms
         occupy the first ``len(active_atoms)`` positions of ``mol``, so the
         fragment AO indices come straight from the leading atom slices.
         """
         if self.selector == "none":
-            return None, None
+            return None, None, None
         from embasi_qiskit_integration.selectors import (
             concentric_localization_selector,
             fragment_ao_indices,
@@ -547,25 +589,52 @@ class EmbeddingWorkflow(BaseSettings):
             groups.append(fragment_ao_indices(mol, positions))
             start += sz
 
-        if self.selector in ("spade", "concentric-cl"):
+        if self.selector in ("spade", "concentric-cl", "apc-concentric"):
             # A rotation cannot be unioned per-fragment the way index selection can,
-            # so both localisers anchor on the UNION of the fragment AOs.
+            # so all three localisers anchor on the UNION of the fragment AOs.
             frag_union = np.unique(np.concatenate(groups)) if groups else np.empty(0, int)
             if self.selector == "spade":
                 # ``n_virtual`` caps the kept rotated shell.
-                return None, spade_virtual_selector(overlap, frag_union, max_virtual=self.n_virtual)
+                return (
+                    None,
+                    spade_virtual_selector(overlap, frag_union, max_virtual=self.n_virtual),
+                    None,
+                )
+            assert emb._fock is not None, "run_low_level() must run before _build_selector()"
+            if self.selector == "apc-concentric":
+                if self.apc_max_size is None:
+                    raise ValueError(
+                        "--selector apc-concentric requires --apc_max_size (nelec,norb)"
+                    )
+                n_shells, max_size, fixed = self.n_shells, self.apc_max_size, self.apc_fixed
+
+                def _orbital_builder(
+                    emb, frag=frag_union, n_shells=n_shells, max_size=max_size, fixed=fixed
+                ):
+                    return emb.build_orbitals_apc_concentric(
+                        fragment_ao=frag, n_shells=n_shells, max_size=max_size, fixed=fixed
+                    )
+
+                return None, None, _orbital_builder
             # concentric-cl: the shell count sets the physically-motivated k; if
             # ``n_virtual`` is given it is a solver-budget CEILING on top of that
             # (for small simulations), truncating the outermost shell tail -- not a
             # replacement for the shell structure.
-            assert emb._fock is not None, "run_low_level() must run before _build_selector()"
             if self.n_virtual is not None and log is not None:
                 log(
                     f"   [selector] concentric-cl: capping the shell-determined virtuals "
                     f"at n_virtual={self.n_virtual} (solver budget)"
                 )
-            return None, concentric_localization_selector(
-                overlap, frag_union, emb._fock, n_shells=self.n_shells, max_virtual=self.n_virtual
+            return (
+                None,
+                concentric_localization_selector(
+                    overlap,
+                    frag_union,
+                    emb._fock,
+                    n_shells=self.n_shells,
+                    max_virtual=self.n_virtual,
+                ),
+                None,
             )
 
         # mulliken: run the per-fragment single-shell Mulliken cut and union.
@@ -575,6 +644,7 @@ class EmbeddingWorkflow(BaseSettings):
             per_fragment_mulliken_selector(
                 overlap, groups, max_virtual_per_fragment=self.n_virtual
             ),
+            None,
             None,
         )
 

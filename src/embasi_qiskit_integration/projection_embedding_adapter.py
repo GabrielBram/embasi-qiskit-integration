@@ -144,6 +144,15 @@ class AOIntegrals(Protocol):
         Used for the inactive-core downfold, independently of the high level.
         """
 
+    def get_k(self, dm: np.ndarray) -> np.ndarray:
+        """Bare HF exchange operator K[dm] (no J, no 0.5 factor), at a 2-occupancy dm.
+
+        Used only by the APC active-space ranking (:meth:`ProjectionEmbeddingAdapter.
+        build_orbitals_apc_concentric`), which needs K's diagonal separately from the
+        combined ``veff_hf`` (King & Gagliardi, *J. Chem. Theory Comput.* **2021**, 17,
+        7. eq. 18: ``(ia|ia) ~ 0.5 K_aa``).
+        """
+
     def eri_mo(self, mo_coeff: np.ndarray) -> np.ndarray:
         """Chemist-notation (pq|rs), shape (nmo,)*4, for the given MO block."""
 
@@ -185,6 +194,9 @@ class PySCFIntegrals:
 
     def veff_hf(self, dm) -> np.ndarray:
         return np.asarray(self._hf.get_veff(self.mol, np.asarray(dm)))
+
+    def get_k(self, dm) -> np.ndarray:
+        return np.asarray(self._hf.get_k(self.mol, np.asarray(dm)))
 
     def eri_mo(self, mo_coeff) -> np.ndarray:
         """Chemist-notation ``(pq|rs)`` over the given MO block, shape (nmo,)*4.
@@ -751,6 +763,117 @@ class ProjectionEmbeddingAdapter:
 
         inactive = np.array([i for i in range(n_occ) if i not in set(active.tolist())], dtype=int)
         return EmbeddedOrbitals(coeff=c, energy=eps, n_occ=n_occ, inactive=inactive, active=active)
+
+    def build_orbitals_apc_concentric(
+        self,
+        *,
+        fragment_ao: np.ndarray,
+        n_shells: int = 0,
+        max_size: int | tuple[int, int],
+        fixed: bool = False,
+        restrict_to_a: bool = True,
+    ) -> EmbeddedOrbitals:
+        """Concentric localization for locality, then APC to rank and truncate.
+
+        Two-stage active-space construction (King & Gagliardi, *J. Chem. Theory
+        Comput.* **2021**, 17, 7387, doi:10.1021/acs.jctc.1c00037):
+
+        1. :func:`~embasi_qiskit_integration.selectors.concentric_localization_selector`
+           rotates the virtual block into fragment-coupled shells -- this answers
+           *which virtuals are spatially/electronically relevant to the embedded
+           region*, the question the level-shift embedding leaves open (it removes
+           subsystem B entirely, but says nothing about which of subsystem A's
+           virtuals matter for the active atoms specifically). Its own shell count
+           (``n_shells``) sets the candidate pool; it is called uncapped
+           (``max_virtual=None``) since APC, not CL's own cap, does the truncation.
+        2. APC (:func:`~embasi_qiskit_integration.selectors.apc_pair_coefficients`
+           / ``apc_orbital_entropies`` / ``apc_active_space``) then ranks *every*
+           candidate orbital -- occupied and virtual together -- by an approximate
+           multiconfigurational pair-coefficient entropy, and truncates to
+           ``max_size``. Unlike every other selector in this package, APC can drop
+           occupied candidates -- it supersedes ``n_frozen_occ`` for this active
+           space; occupied freezing is a ranking outcome, not a caller-set count.
+
+        CL's kept virtuals are rotated, not Fock eigenvectors, so ``ε_a`` in APC's
+        eq. 19 is recomputed as the expectation value ``diag(C^T F_emb C)`` in
+        the *current* (possibly rotated) basis rather than read off
+        ``EmbeddedOrbitals.energy`` (which CL already sets to ``NaN`` for exactly
+        this reason -- see :meth:`build_orbitals`). The exchange diagonal is
+        computed the same way against ``self.ints.get_k`` at the full-A 2-occupancy
+        density, mirroring the inactive-core downfold's ``dm_in`` in
+        :meth:`embedded_hamiltonian`.
+
+        Outer-loop stability: this selection is recomputed every self-consistency
+        cycle from the current ``F_emb`` (see ``EmbeddingWorkflow._run_outer_loop``).
+        ``fixed=True`` (with a ``(nelec, norb)`` ``max_size``) pins the selection to
+        exactly that size every cycle; the default dynamic drop-until-budget
+        (``fixed=False``) can flip which near-tied orbital is dropped as the Fock
+        matrix drifts cycle to cycle, changing the active-space size -- and hence
+        the qubit count -- mid-run. Use ``fixed=True`` for anything feeding
+        ``_run_outer_loop`` with ``max_cycles > 1``.
+
+        Args:
+            fragment_ao: AO indices of the active-fragment atoms (as
+                :func:`~embasi_qiskit_integration.selectors.fragment_ao_indices`).
+            n_shells: CL shell expansions after shell 0 (the locality pre-filter's
+                own accuracy knob; see :func:`~embasi_qiskit_integration.selectors.
+                concentric_localization_selector`).
+            max_size: APC's active-space budget, forwarded to
+                :func:`~embasi_qiskit_integration.selectors.apc_active_space`: an
+                orbital-count ceiling (int; ``Chooser``'s convention, not an
+                ``N_CSF`` count), or a ``(nelec, norb)`` target (required if
+                ``fixed=True``).
+            fixed: pin the exact ``(nelec, norb)`` rather than dynamically dropping
+                (see the stability note above).
+            restrict_to_a: forwarded to the CL stage's :meth:`build_orbitals` call
+                (see its docstring) -- a pure performance knob, ``False`` only
+                needed to exercise this against a stub adapter without live EmbASI.
+
+        Returns:
+            The APC-selected :class:`EmbeddedOrbitals`.
+        """
+        from embasi_qiskit_integration.selectors import (
+            apc_active_space,
+            apc_orbital_entropies,
+            apc_pair_coefficients,
+            concentric_localization_selector,
+        )
+
+        cl = concentric_localization_selector(
+            self._s_arr, fragment_ao, self._fock_arr, n_shells=n_shells
+        )
+        orbitals = self.build_orbitals(
+            n_frozen_occ=0, virtual_localizer=cl, restrict_to_a=restrict_to_a
+        )
+
+        c_full = orbitals.coeff  # (nao, n_A): every subsystem-A orbital, occ + virt
+        n_orb = c_full.shape[1]
+        n_occ = orbitals.n_occ
+
+        dm_a = 2.0 * c_full[:, :n_occ] @ c_full[:, :n_occ].T
+        k_ao = self.ints.get_k(dm_a)
+        f_diag = np.einsum("pi,pq,qi->i", c_full, self._fock_arr, c_full)
+        k_diag = np.einsum("pi,pq,qi->i", c_full, k_ao, c_full)
+
+        # CL's own (uncapped) shell pool is the candidate set APC ranks within; every
+        # orbital outside it (CL's kernel remainder -- spatially irrelevant to the
+        # fragment) gets a sentinel entropy far below the real range so Chooser
+        # always drops it before any genuine candidate.
+        cand_occ = orbitals.active[orbitals.active < n_occ]
+        cand_virt = orbitals.active[orbitals.active >= n_occ]
+        c_pairs = apc_pair_coefficients(f_diag[cand_occ], f_diag[cand_virt], k_diag[cand_virt])
+        s_occ, s_virt = apc_orbital_entropies(c_pairs)
+
+        entropies = np.full(n_orb, -1.0e18)
+        entropies[cand_occ], entropies[cand_virt] = s_occ, s_virt
+
+        occ_pattern = np.where(np.arange(n_orb) < n_occ, 2, 0)
+        active = apc_active_space(occ_pattern, entropies, max_size, fixed=fixed)
+
+        inactive = np.array([i for i in range(n_occ) if i not in set(active.tolist())], dtype=int)
+        return EmbeddedOrbitals(
+            coeff=c_full, energy=orbitals.energy, n_occ=n_occ, inactive=inactive, active=active
+        )
 
     # ---------------- downfolding ---------------- #
     def embedded_hamiltonian(self, orbitals: EmbeddedOrbitals) -> EmbeddedHamiltonian:
