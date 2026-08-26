@@ -201,6 +201,16 @@ class EmbeddingWorkflow(BaseSettings):
     rho_tol: float = 1.0e-5  # max |Δγ^A| convergence threshold
     converge_on: Literal["energy_and_density", "energy"] = "energy"
     mix_alpha: float = 0.5  # linear density mixing (1.0 -> undamped)
+    # Pulay/DIIS acceleration of the density feedback, in place of plain linear
+    # mixing.  Off by default (``mix_alpha`` is the historical behaviour); once
+    # enough history has accumulated (>= 2 cycles) each new trial density is the
+    # DIIS-extrapolated combination of past outputs rather than a linear blend of
+    # the last two -- see ``_diis_extrapolate`` and the note in
+    # ``_run_outer_loop``.  ``mix_alpha`` still governs the bootstrap cycle before
+    # DIIS has two vectors to work with, and any cycle where the DIIS subspace
+    # matrix is singular.
+    diis: bool = False
+    diis_size: int = 8  # max (input, output) pairs kept in the DIIS subspace
     reseed_sqd: bool = True  # re-sample the SQD subspace each cycle
 
     # --- solver / sampling --- #
@@ -340,6 +350,20 @@ class EmbeddingWorkflow(BaseSettings):
         the fraction of the new density (``1.0`` is undamped).  ``0.5`` converges
         max|Δγ^A| monotonically to ~1e-7 here; smaller is safer but slower.
 
+        Near a vanishing HOMO-LUMO gap in the embedded fragment (e.g. bond
+        dissociation), linear mixing can fail outright: the map picks up a
+        large-magnitude oscillatory eigenvalue that no practical ``mix_alpha``
+        rescales below 1, and the iterates settle into a stable limit cycle
+        (period-2 in practice) rather than converging.  ``--diis`` replaces the
+        linear blend with Pulay/DIIS extrapolation (see ``_diis_extrapolate``):
+        once >= 2 (input, output) pairs are on hand it solves for the
+        minimum-residual combination of past *outputs* directly, which damps
+        exactly this kind of oscillation far better than any fixed ``mix_alpha``
+        because the mixing coefficients adapt to the observed residual history
+        instead of being fixed in advance.  ``mix_alpha`` still governs the
+        first feedback cycle (only one vector on hand -- nothing to extrapolate)
+        and any cycle where the DIIS subspace is singular.
+
         ``orbital_builder`` (set only for ``selector="apc-concentric"``) bypasses
         ``emb.build_orbitals(selector=..., virtual_localizer=...)`` entirely: APC's
         two-stage construction (CL locality pre-filter, then APC ranks and
@@ -351,6 +375,9 @@ class EmbeddingWorkflow(BaseSettings):
         prev_dm_a = None
         prev_fed = None
         energy = None
+        diis_inputs: list[np.ndarray] = []
+        diis_outputs: list[np.ndarray] = []
+        diis_residuals: list[np.ndarray] = []
 
         for cycle in range(self.max_cycles):
             tag = "" if self.max_cycles == 1 else f" [cycle {cycle + 1}/{self.max_cycles}]"
@@ -444,20 +471,68 @@ class EmbeddingWorkflow(BaseSettings):
                 break
 
             log(f"== Step 5: feed the correlated 1-RDM back into the embedding =={tag}")
-            # Every rank holds the broadcast result, so the density feedback --
-            # and the collective construct_embedded_fock call inside it -- stay
-            # consistent across the communicator.  Linearly mix the fed-back
-            # total density (γ̃^A + γ^B) with the previous cycle's to damp the
-            # otherwise-divergent fixed-point iteration; mix_alpha=1.0 is the
-            # bare (undamped) feedback emb.feedback would do on its own.
+            # Single-core implementation of DIIS - Claude Anthropic.
             fed = emb.rdm1_ao(result.rdm1, orbitals)
-            if prev_fed is not None and self.mix_alpha != 1.0:
+            mixing_desc = f"mix_alpha={self.mix_alpha}"
+            extrapolated = None
+            if self.diis:
+                diis_inputs.append(dm_a_now)
+                diis_outputs.append(fed)
+                diis_residuals.append(fed - dm_a_now)
+                if len(diis_residuals) > self.diis_size:
+                    diis_inputs.pop(0)
+                    diis_outputs.pop(0)
+                    diis_residuals.pop(0)
+                if len(diis_residuals) >= 2:
+                    extrapolated = self._diis_extrapolate(diis_residuals, diis_outputs)
+                if extrapolated is not None:
+                    fed = extrapolated
+                    mixing_desc = f"diis(n={len(diis_residuals)})"
+                else:
+                    mixing_desc = f"mix_alpha={self.mix_alpha} (DIIS bootstrap/fallback)"
+            if extrapolated is None and prev_fed is not None and self.mix_alpha != 1.0:
+                # Linear mixing: DIIS's bootstrap cycle (< 2 vectors) and its
+                # fallback when the subspace matrix is singular (as well as the
+                # historical --diis=False default).
                 fed = self.mix_alpha * fed + (1.0 - self.mix_alpha) * prev_fed
             prev_fed = fed
-            emb.run_low_level(dma_in=fed, dmb_in=emb._dm_b)
-            log(f"   embedded Fock rebuilt at γ̃^A + γ^B (mix_alpha={self.mix_alpha}).")
+            #emb.run_low_level(dma_in=fed, dmb_in=emb._dm_b)
+            emb.run_low_level_a_only(dma_in=fed, dmb_in=emb._dm_b)
+            log(f"   embedded Fock rebuilt at γ̃^A + γ^B ({mixing_desc}).")
 
         return energy
+
+    @staticmethod
+    def _diis_extrapolate(
+        residuals: list[np.ndarray], outputs: list[np.ndarray]
+    ) -> np.ndarray | None:
+        """Pulay/DIIS extrapolation of the density-feedback fixed point.
+
+        Standard DIIS: find coefficients ``c`` (summing to 1) minimising
+        ``|| sum_i c_i * residuals[i] ||``, by solving the bordered linear system
+
+            [B  -1] [c]   [0]
+            [-1  0] [λ] = [-1]
+        Returns ``None`` (caller falls back to linear mixing) if ``B`` is
+        singular -- expected once residuals shrink toward linear dependence
+        near convergence, and routine if two cycles happen to produce
+        near-identical residuals.
+        """
+        n = len(residuals)
+        b = np.empty((n + 1, n + 1))
+        for i, ri in enumerate(residuals):
+            for j, rj in enumerate(residuals):
+                b[i, j] = float(np.vdot(ri, rj).real)
+        b[:n, n] = -1.0
+        b[n, :n] = -1.0
+        b[n, n] = 0.0
+        rhs = np.zeros(n + 1)
+        rhs[n] = -1.0
+        try:
+            coeffs = np.linalg.solve(b, rhs)[:n]
+        except np.linalg.LinAlgError:
+            return None
+        return sum(c * o for c, o in zip(coeffs, outputs))
 
     def _maybe_reseed(self, solver, cycle: int) -> None:
         """Advance the SQD seed each cycle unless the subspace is carried over.

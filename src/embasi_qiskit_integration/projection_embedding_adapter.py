@@ -244,6 +244,7 @@ class FHIaimsIntegrals:
 # Orbital bookkeeping
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
+
 class EmbeddedOrbitals:
     """Orthonormal orbitals of subsystem A in the (possibly truncated) AO basis."""
 
@@ -349,6 +350,7 @@ class ProjectionEmbeddingAdapter:
 
         # Populated by run_low_level(); None until then, hence the optional type.
         self._dm_a: np.ndarray | None = None  # γ^A (localized, low level), AO, 2-occupancy
+        self._dm_a_init: np.ndarray | None = None  # γ^A (localized, low level), AO, 2-occupancy
         self._dm_b: np.ndarray | None = None  # γ^B (environment, frozen), AO
         self._fock: np.ndarray | None = None  # F_emb
         self._s: np.ndarray | None = None
@@ -359,6 +361,47 @@ class ProjectionEmbeddingAdapter:
         self._v_emb_embasi: np.ndarray | None = None
 
     # ---------------- low-level embedding ---------------- #
+    def run_low_level_a_only(self, dma_in: np.ndarray | None = None,
+                             dmb_in: np.ndarray | None = None) -> None:
+
+        wrapped_dma_in = None if dma_in is None else self._as_spin_kpoint_array(dma_in)
+
+        self.p.A_LL.run_noscf(dm_in=wrapped_dma_in)
+
+        # EmbASI returns SpinKpointArray objects (leading (nspin, nkpt) axes)
+        # holding real restricted data in a complex128 dtype; _as_ao_matrix
+        # squeezes the length-1 leading axes and drops the (asserted-negligible)
+        # imaginary part, so everything downstream (einsum, sla.eigh, veff) sees
+        # a bare 2-occupancy real (nao, nao) matrix.
+        self._dm_a = dma_in
+        self._dm_b = dmb_in
+        self._s = self.ints.overlap()
+
+        self._v_emb_embasi = self._v_emb_embasi
+        self._p_b = self._p_b
+
+        # Assemble F_emb exactly as EmbASI's construct_embedded_fock does, from the
+        # A_LL one-electron blocks plus the exported v_emb and P_B.  Reading these
+        # off the same A_LL object EmbASI integrated keeps the downfold bit-identical
+        # to the previous construct_embedded_fock() path.
+        h_kin_a = self._as_ao_matrix(self.p.A_LL.hamiltonian_kinetic)
+        h_estat_xc_a = self._as_ao_matrix(self.p.A_LL.hamiltonian_estat_plus_xc)
+        self._fock = h_kin_a + h_estat_xc_a + self._v_emb_embasi + self._p_b
+        self._validate_densities()
+
+        # Cross-check our level-shift mu against the value EmbASI used inside the
+        # SCF.  We now read P_B directly, but self.mu still parameterises the
+        # adapter (e.g. the p_b property fallback and meta), so a silent mismatch
+        # would be confusing; keep the loud check.
+        mu_embasi = getattr(self.p, "mu_val", None)
+        if mu_embasi is not None and not np.isclose(float(mu_embasi), self.mu, rtol=1e-9, atol=0.0):
+            raise ValueError(
+                f"level-shift mu mismatch: adapter mu={self.mu:g} but EmbASI "
+                f"used mu_val={float(mu_embasi):g}; the exported P_B was built "
+                f"with mu_val, not the adapter's mu"
+            )
+
+
     def run_low_level(
         self, dma_in: np.ndarray | None = None, dmb_in: np.ndarray | None = None
     ) -> None:
@@ -393,6 +436,8 @@ class ProjectionEmbeddingAdapter:
         # imaginary part, so everything downstream (einsum, sla.eigh, veff) sees
         # a bare 2-occupancy real (nao, nao) matrix.
         self._dm_a = self._as_ao_matrix(dm_a)
+        if self._dm_a_init is None:
+            self._dm_a_init = self._as_ao_matrix(dm_a)
         self._dm_b = self._as_ao_matrix(dm_b)
         self._s = self.ints.overlap()
 
@@ -453,6 +498,11 @@ class ProjectionEmbeddingAdapter:
     def _dm_a_arr(self) -> np.ndarray:
         """The localized subsystem-A density γ^A (requires :meth:`run_low_level`)."""
         return self._require(self._dm_a, "the subsystem-A density")
+
+    @property
+    def _dm_a_arr_init(self) -> np.ndarray:
+        """The localized subsystem-A density γ^A (requires :meth:`run_low_level`)."""
+        return self._require(self._dm_a_init, "the subsystem-A density")
 
     @property
     def _dm_b_arr(self) -> np.ndarray:
@@ -763,6 +813,16 @@ class ProjectionEmbeddingAdapter:
         else:
             active = np.arange(n_frozen_occ, n_occ + n_virt)
 
+
+        #from pyscf.tools import cubegen
+        #for occ_idx in np.arange(0,n_occ):
+        #    print(occ_idx)
+        #    cubegen.orbital(self.p.A_LL.atoms.calc.method.mol, f'orbital_occ_{occ_idx}.cube', c[:, occ_idx])
+        #
+        #for virt_idx in np.arange(n_occ,n_occ+n_virt):
+        #    print(virt_idx)
+        #    cubegen.orbital(self.p.A_LL.atoms.calc.method.mol, f'orbital_virt_{virt_idx}.cube', c[:, virt_idx])
+
         inactive = np.array([i for i in range(n_occ) if i not in set(active.tolist())], dtype=int)
         return EmbeddedOrbitals(coeff=c, energy=eps, n_occ=n_occ, inactive=inactive, active=active)
 
@@ -866,12 +926,21 @@ class ProjectionEmbeddingAdapter:
         c_pairs = apc_pair_coefficients(f_diag[cand_occ], f_diag[cand_virt], k_diag[cand_virt])
         s_occ, s_virt = apc_orbital_entropies(c_pairs)
 
+        #from pyscf.tools import cubegen
+        #for occ_idx in np.arange(0,n_occ):
+        #    print(occ_idx)
+        #    cubegen.orbital(self.p.A_LL.atoms.calc.method.mol, f'orbital_occ_{occ_idx}.cube', c_full[:, occ_idx])
+
+        #for virt_idx in np.arange(n_occ,n_orb):
+        #    print(virt_idx)
+        #    cubegen.orbital(self.p.A_LL.atoms.calc.method.mol, f'orbital_virt_{virt_idx}.cube', c_full[:, virt_idx])
+
         entropies = np.full(n_orb, -1.0e18)
         entropies[cand_occ], entropies[cand_virt] = s_occ, s_virt
 
         occ_pattern = np.where(np.arange(n_orb) < n_occ, 2, 0)
         active = apc_active_space(occ_pattern, entropies, max_size, fixed=fixed)
-
+        print(f"ACTIVE SPACE: {active}")
         inactive = np.array([i for i in range(n_occ) if i not in set(active.tolist())], dtype=int)
         return EmbeddedOrbitals(
             coeff=c_full, energy=orbitals.energy, n_occ=n_occ, inactive=inactive, active=active
@@ -960,7 +1029,7 @@ class ProjectionEmbeddingAdapter:
 
         leak = float(np.einsum("ij,ji->", dm_hl, p_b))
         e_high_a = float(result.energy) - np.einsum("ij,ji->", dm_hl, v_emb) - leak
-        correction = float(np.einsum("ij,ji->", dm_hl - self._dm_a_arr, v_emb))
+        correction = float(np.einsum("ij,ji->", dm_hl - self._dm_a_arr_init, v_emb))
 
         # Rebase e_high_A onto E_low(A)'s (ghosted subsystem-A) nuclear footing.
         hcore_a, enuc_a = self._a_fragment_footing()
