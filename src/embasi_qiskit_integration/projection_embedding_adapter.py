@@ -403,8 +403,8 @@ class ProjectionEmbeddingAdapter:
 
 
     def run_low_level(
-        self, dma_in: np.ndarray | None = None, dmb_in: np.ndarray | None = None
-    ) -> None:
+            self, dma_in: np.ndarray | None = None, dmb_in: np.ndarray | None = None,
+            a_nelecs: int | None = None ) -> None:
         """Drive EmbASI: supersystem SCF, SPADE/PM localisation, F_emb."""
         # TODO(embasi-api): EmbASI does not expose the retained-AO index array
         # under basis truncation (paper Sec. 2.4, threshold tau).  With
@@ -427,7 +427,7 @@ class ProjectionEmbeddingAdapter:
         # density the outer loop feeds back -- wrap it (mirror of the _as_ao_matrix
         # squeeze on the way out) so the multi-cycle loop runs against real EmbASI.
         dm_a, dm_b, _overlap, v_emb_embasi, p_b_embasi = self.p.construct_embedding_potential(
-            dma_in=wrapped_dma_in, dmb_in=wrapped_dmb_in
+            dma_in=wrapped_dma_in, dmb_in=wrapped_dmb_in, a_nelecs=a_nelecs
         )
 
         # EmbASI returns SpinKpointArray objects (leading (nspin, nkpt) axes)

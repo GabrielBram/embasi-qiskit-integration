@@ -142,6 +142,8 @@ class EmbeddingWorkflow(BaseSettings):
     xc_hl: str = "HF"
     mu: float = 1.0e6  # level-shift parameter, paper Eq. 6
 
+    a_nelecs: int | None = None # Fixes the number of electrons selected by SPADE
+
     # --- active space: solver budget only, not embedding physics --- #
     n_frozen_occ: int = 0
     n_virtual: int | None = None  # solver-budget cap; None -> the selector's own count
@@ -278,7 +280,7 @@ class EmbeddingWorkflow(BaseSettings):
 
         # WF-in-DFT only.  Collective on every rank: EmbASI's supersystem SCF,
         # SPADE/Pipek-Mezey localisation, and the embedded Fock all run in here.
-        emb.run_low_level()
+        emb.run_low_level(a_nelecs=self.a_nelecs)
         selector, virtual_localizer, orbital_builder = self._build_selector(emb, log=log)
         solver = self._build_solver()
         return self._run_outer_loop(
