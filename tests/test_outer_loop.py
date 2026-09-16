@@ -131,7 +131,7 @@ class _FeedbackMockEmbedding:
             atoms=SimpleNamespace(calc=SimpleNamespace(mol=mol)),
             hamiltonian_kinetic=h_kin[np.newaxis, np.newaxis, :, :],
             hamiltonian_estat_plus_xc=(h_core - h_kin)[np.newaxis, np.newaxis, :, :],
-            run_noscf=noop
+            run_noscf=noop,
         )
 
         c_a = c_occ[:, :n_occ_a]
@@ -422,9 +422,7 @@ def test_diis_extrapolate_converges_a_map_plain_iteration_never_settles():
         residuals.append(y - x)
         outputs.append(y)
         extrapolated = (
-            EmbeddingWorkflow._diis_extrapolate(residuals, outputs)
-            if len(residuals) >= 2
-            else None
+            EmbeddingWorkflow._diis_extrapolate(residuals, outputs) if len(residuals) >= 2 else None
         )
         x = extrapolated if extrapolated is not None else y
     np.testing.assert_allclose(x, x_star, atol=1e-8)
@@ -432,7 +430,9 @@ def test_diis_extrapolate_converges_a_map_plain_iteration_never_settles():
     x_plain = np.array([0.0, 2.0])
     for _ in range(5):
         x_plain = f(x_plain)
-    assert np.abs(x_plain - x_star).max() > 1.0, "sanity: plain iteration should still be oscillating"
+    assert np.abs(x_plain - x_star).max() > 1.0, (
+        "sanity: plain iteration should still be oscillating"
+    )
 
 
 def test_diis_extrapolate_returns_none_for_a_singular_subspace():
