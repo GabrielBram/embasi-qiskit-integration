@@ -78,10 +78,6 @@ Upstream gaps that remain (each marked ``TODO(embasi-api)`` inline):
   but not the (truncated) ERIs -- the ``V^{-1/2}``-contracted ``M^P_{pq}`` with
   ``(pq|rs) = sum_P M^P_pq M^P_rs`` -- so FHI-aims cannot drive the WF-in-DFT half
   and the workflow stays PySCF-only.  See :class:`FHIaimsIntegrals`.
-* **No A-fragment footing (h_core^A / E_nuc^A).**  The WF-path nuclear-frame rebase
-  reaches through ``A_LL.atoms.calc.mol`` to a PySCF ``Mole`` because EmbASI exposes
-  no backend-agnostic A-fragment one-electron operator / nuclear repulsion; the
-  rebase is therefore PySCF-only.  See :meth:`_a_fragment_footing`.
 * **Huzinaga as a constant offset when high/low xc match** (paper Sec. 2.1).
   ``H^{AB}_H`` then collapses to the supersystem low-level Hamiltonian, making
   ``P_B`` a constant matrix -- exportable after all, in exactly the WF-in-DFT
@@ -138,6 +134,13 @@ class AOIntegrals(Protocol):
         contribution EmbASI folded into ``F_emb``.
         """
 
+    def veff_ll(self, dm: np.ndarray) -> np.ndarray:
+        """Effective potential of the *low-level* calculator, at a 2-occupancy dm.
+
+        Must match ``calc_base_ll``: it exists only to undo the mean-field
+        contribution EmbASI folded into ``F_emb``.
+        """
+
     def veff_hf(self, dm: np.ndarray) -> np.ndarray:
         """Hartree-Fock effective potential J[dm] - K[dm]/2, at a 2-occupancy dm.
 
@@ -158,6 +161,8 @@ class AOIntegrals(Protocol):
 
     def energy_nuc(self) -> float: ...
 
+    def energy_low(self, dm: np.ndarray) -> float:
+        """Full-supersystem low-level total energy at an arbitrary 2-occupancy dm."""
 
 class PySCFIntegrals:
     """Backend for the ``examples/PySCF`` path of the qm-code-adapter branch.
@@ -174,8 +179,9 @@ class PySCFIntegrals:
       ``"cc-pvtz-ri"``); ``True`` lets PySCF pick the default aux for ``mol.basis``.
     """
 
-    def __init__(self, mf_hl, *, density_fit: bool | str = False):
+    def __init__(self, mf_hl, mf_ll, *, density_fit: bool | str = False):
         self.mf = mf_hl  # the same object passed to calc_base_hl
+        self.mf_ll = mf_ll  # the same object passed to calc_base_hl
         self.mol = mf_hl.mol
         self._hf = mf_hl.mol.RHF()  # integral engine only; never kernel()'d
         self._density_fit = density_fit
@@ -191,6 +197,9 @@ class PySCFIntegrals:
 
     def veff_hl(self, dm) -> np.ndarray:
         return np.asarray(self.mf.get_veff(self.mol, np.asarray(dm)))
+
+    def veff_ll(self, dm: np.ndarray) -> np.ndarray:
+        return np.asarray(self.mf_ll.get_veff(self.mol, np.asarray(dm)))
 
     def veff_hf(self, dm) -> np.ndarray:
         return np.asarray(self._hf.get_veff(self.mol, np.asarray(dm)))
@@ -284,11 +293,14 @@ class ProjectionEnergy:
     """Term-by-term breakdown of paper Eq. 8."""
 
     e_low_total: float  # E_L[γ^A + γ^B]
-    e_low_A: float  # E_L[γ^A]
-    e_high_A: float  # E_H[Ψ̃^A], embedding pot. removed, rebased to E_low(A)'s footing
+    e_low_A: float  # E_L[γ^A], computed on the same unghosted frame as e_high_A
+    e_high_A: float  # E_H[Ψ̃^A], embedding pot. removed
     correction: float  # tr[(γ̃^A - γ^A) v_emb]
     projector_leak: float  # tr[γ̃^A P_B], a numerical zero when clean
-    footing_shift: float = 0.0  # nuclei/hcore rebasing applied to e_high_A (see below)
+    # Kept for the DFT-in-DFT path's/callers' sake; always 0.0 on the WF path now that
+    # e_low_A is computed on the same (unghosted) frame as e_high_A -- see
+    # AOIntegrals.energy_low and ProjectionEmbeddingAdapter.projection_energy.
+    footing_shift: float = 0.0
 
     @property
     def total(self) -> float:
@@ -474,6 +486,45 @@ class ProjectionEmbeddingAdapter:
                 f"with mu_val, not the adapter's mu"
             )
 
+    def relax_active_hf(self) -> None:
+        """Converge subsystem A's embedded-HF reference on A_HL, in the frozen
+        v_emb/P_B potential :meth:`run_low_level` already built.
+
+        ``self._fock`` (from :meth:`run_low_level`) is the *low-level* (``xc_ll``)
+        ``A_LL`` Fock plus the embedding potential, diagonalized once and never fed
+        back into itself -- Brillouin's theorem does not hold for the orbitals it
+        returns.  For ``xc_hl="HF"`` this adapter's ``A_HL`` calculator IS the
+        intended high-level reference; EmbASI already owns a converged, embedded
+        SCF for it -- ``ProjectionEmbedding.freeze_and_thaw``'s final step
+        (``embasi/embedding.py:793-812``), factored out here as a standalone call
+        on the frozen potential :meth:`run_low_level` already produced.
+        ``PySCFAdapter.run_scf`` injects ``v_emb + P_B`` via a ``get_fock``
+        override every cycle and delegates DIIS/damping to PySCF's own
+        ``mf.kernel()``, so no separate SCF loop needs writing here.
+
+        Sets ``self._fock_relaxed`` / ``self._dm_a_relaxed``.  ``self._fock`` /
+        ``self._dm_a`` (still read by :attr:`h_emb`, :attr:`v_emb`, and the
+        DFT-in-DFT path) are untouched -- ``h_emb = h_core + v_emb + P_B`` is a
+        level-independent identity of whichever Fock built it, so it needs no
+        relaxed counterpart.  Call ``build_orbitals(use_relaxed=True)`` (or
+        ``build_orbitals_apc_concentric(use_relaxed=True)``) afterward to
+        diagonalize this instead of the low-level Fock.
+        """
+        self.p.A_HL.input_fragment_nelectrons = self.p.A_pop
+        self.p.A_HL.run_emb_scf(
+            dm_in=self._as_spin_kpoint_array(self._dm_a_arr),
+            emb_pot=self._as_spin_kpoint_array(self._v_emb_embasi),
+            proj_pot=self._as_spin_kpoint_array(self._p_b),
+        )
+
+        # Same assembly as run_low_level's self._fock, off A_HL's converged
+        # one-electron blocks instead of A_LL's frozen ones (mirrors
+        # ProjectionEmbedding.construct_embedded_fock, embasi/embedding.py:841).
+        h_kin_a = self._as_ao_matrix(self.p.A_HL.hamiltonian_kinetic)
+        h_estat_xc_a = self._as_ao_matrix(self.p.A_HL.hamiltonian_estat_plus_xc)
+        self._fock_relaxed = h_kin_a + h_estat_xc_a + self._v_emb_embasi + self._p_b
+        self._dm_a_relaxed = self._as_ao_matrix(self.p.A_HL.density_matrices_out)
+
     # ---------------- low-level state accessors ---------------- #
     # ``_dm_a``/``_dm_b``/``_fock``/``_s`` are only populated by run_low_level().
     # These accessors turn "used before the embedding ran" from an AttributeError
@@ -513,6 +564,14 @@ class ProjectionEmbeddingAdapter:
     def _fock_arr(self) -> np.ndarray:
         """The embedded Fock matrix F_emb (requires :meth:`run_low_level`)."""
         return self._require(self._fock, "the embedded Fock matrix")
+
+    @property
+    def _fock_relaxed_arr(self) -> np.ndarray:
+        """The relaxed embedded-HF Fock on A_HL (requires :meth:`relax_active_hf`)."""
+        return self._require(
+            getattr(self, "_fock_relaxed", None),
+            "the relaxed embedded-HF Fock matrix (call relax_active_hf() first)",
+        )
 
     @staticmethod
     def _as_ao_matrix(m) -> np.ndarray:
@@ -657,7 +716,8 @@ class ProjectionEmbeddingAdapter:
         opaque ``construct_embedded_fock`` -- the projector it subtracts back out
         via :attr:`p_b` is EmbASI's own exported ``P_B``, not a reconstruction.
         """
-        return self._fock_arr - self.ints.veff_hl(self._dm_a_arr)
+        #return self._fock_arr - self.ints.veff_hl(self._dm_a_arr)
+        return self._fock_arr - self.ints.veff_ll(self._dm_a_arr)
 
     @property
     def v_emb(self) -> np.ndarray:
@@ -677,21 +737,28 @@ class ProjectionEmbeddingAdapter:
         return self.h_emb - self.ints.hcore() - self.p_b
 
     # ---------------- orbital construction ---------------- #
-    def _eigh_subsystem_a(self) -> tuple[np.ndarray, np.ndarray]:
-        """Diagonalize F_emb inside span(A) instead of the full AO basis.
-
+    def _eigh_subsystem_a(self, fock: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+        """Diagonalize ``fock`` (default F_emb) inside span(A), not the full AO basis.
+\
         span(B) is spanned by the localized environment orbitals ``mo_b_ll``, so
         its S-orthogonal complement *is* span(A).  Build an S-orthonormal basis
         ``Q`` of that complement (dim ``nao - n_occ_B``), solve the small
-        standard eigenproblem ``(Q^T F_emb Q) u = eps u``, and map back
+        standard eigenproblem ``(Q^T fock Q) u = eps u``, and map back
         ``C = Q u``.  The returned orbitals are S-orthonormal by construction and
         the level shift no longer appears (B is gone), so no ``eps < floor`` cut
         is needed.  For a large environment this replaces an O(nao^3) generalized
         solve with one on the much smaller A block.
 
+        ``fock`` defaults to :attr:`_fock_arr` (the low-level F_emb); pass
+        :attr:`_fock_relaxed_arr` to diagonalize the relaxed embedded-HF
+        reference instead (see :meth:`relax_active_hf`) -- the S-orthogonal
+        complement of span(B) is unaffected by which Fock is diagonalized within
+        it, only ``mo_b_ll``/``_s_arr`` matter for building ``Q``.
+
         Falls back to nothing: if ``mo_b_ll`` is unavailable the caller uses the
         full-basis path via ``restrict_to_a=False``.
         """
+        fock = self._fock_arr if fock is None else fock
         s = self._s_arr
         c_b = self.mo_b_ll  # (nao, n_occ_B), S-orthonormal
         # Project span(B) out in the S-metric: P = I - c_b c_b^T S.
@@ -706,7 +773,7 @@ class ProjectionEmbeddingAdapter:
         nonzero = w > 1e-8
         q = y @ u[:, nonzero] @ np.diag(1.0 / np.sqrt(w[nonzero]))
         # Small standard eigenproblem in the A basis (Q^T S Q = I by construction).
-        fs = q.T @ self._fock_arr @ q
+        fs = q.T @ fock @ q
         eps, cc = np.linalg.eigh(fs)
         return eps, q @ cc
 
@@ -718,8 +785,16 @@ class ProjectionEmbeddingAdapter:
         selector: Selector | None = None,
         virtual_localizer: VirtualLocalizer | None = None,
         restrict_to_a: bool = True,
+        use_relaxed: bool = False,
     ) -> EmbeddedOrbitals:
         """Orbitals of subsystem A from the generalized problem F_emb C = S C eps.
+
+        ``use_relaxed=True`` diagonalizes the relaxed embedded-HF Fock from
+        :meth:`relax_active_hf` (:attr:`_fock_relaxed_arr`) instead of the
+        one-shot low-level F_emb (:attr:`_fock_arr`).  The downfold itself
+        (:meth:`embedded_hamiltonian`) is unaffected by this choice: it reads
+        :attr:`h_emb`, the level-independent ``h_core + v_emb + P_B`` identity,
+        not ``F_emb`` directly, so it needs no matching flag.
 
         The default is the **full** subsystem-A space: every orbital surviving
         the level shift.  That is the WF-in-DFT problem the paper actually
@@ -766,10 +841,11 @@ class ProjectionEmbeddingAdapter:
                 "pass either selector or virtual_localizer, not both: a localiser "
                 "rotates and cuts the virtual block itself"
             )
+        fock = self._fock_relaxed_arr if use_relaxed else self._fock_arr
         if restrict_to_a:
-            eps, c = self._eigh_subsystem_a()
+            eps, c = self._eigh_subsystem_a(fock)
         else:
-            eps, c = sla.eigh(self._fock_arr, self._s_arr)
+            eps, c = sla.eigh(fock, self._s_arr)
             keep = eps < self._floor  # level shift removes subsystem B
             eps, c = eps[keep], c[:, keep]
 
@@ -834,6 +910,7 @@ class ProjectionEmbeddingAdapter:
         max_size: int | tuple[int, int],
         fixed: bool = False,
         restrict_to_a: bool = True,
+        use_relaxed: bool = False,
     ) -> EmbeddedOrbitals:
         """Concentric localization for locality, then APC to rank and truncate.
 
@@ -890,6 +967,11 @@ class ProjectionEmbeddingAdapter:
             restrict_to_a: forwarded to the CL stage's :meth:`build_orbitals` call
                 (see its docstring) -- a pure performance knob, ``False`` only
                 needed to exercise this against a stub adapter without live EmbASI.
+            use_relaxed: diagonalize the relaxed embedded-HF Fock from
+                :meth:`relax_active_hf` instead of the one-shot low-level F_emb
+                (forwarded to the CL stage's :meth:`build_orbitals` call; also
+                used for the ``f_diag``/APC-ranking Fock below, so CL and APC
+                agree on which Fock produced the candidates they rank).
 
         Returns:
             The APC-selected :class:`EmbeddedOrbitals`.
@@ -901,11 +983,13 @@ class ProjectionEmbeddingAdapter:
             concentric_localization_selector,
         )
 
+        fock = self._fock_relaxed_arr if use_relaxed else self._fock_arr
         cl = concentric_localization_selector(
-            self._s_arr, fragment_ao, self._fock_arr, n_shells=n_shells
+            self._s_arr, fragment_ao, fock, n_shells=n_shells
         )
         orbitals = self.build_orbitals(
-            n_frozen_occ=0, virtual_localizer=cl, restrict_to_a=restrict_to_a
+            n_frozen_occ=0, virtual_localizer=cl, restrict_to_a=restrict_to_a,
+            use_relaxed=use_relaxed,
         )
 
         c_full = orbitals.coeff  # (nao, n_A): every subsystem-A orbital, occ + virt
@@ -914,7 +998,7 @@ class ProjectionEmbeddingAdapter:
 
         dm_a = 2.0 * c_full[:, :n_occ] @ c_full[:, :n_occ].T
         k_ao = self.ints.get_k(dm_a)
-        f_diag = np.einsum("pi,pq,qi->i", c_full, self._fock_arr, c_full)
+        f_diag = np.einsum("pi,pq,qi->i", c_full, fock, c_full)
         k_diag = np.einsum("pi,pq,qi->i", c_full, k_ao, c_full)
 
         # CL's own (uncapped) shell pool is the candidate set APC ranks within; every
@@ -998,55 +1082,31 @@ class ProjectionEmbeddingAdapter:
     def projection_energy(
         self, result: SolverResult, orbitals: EmbeddedOrbitals
     ) -> ProjectionEnergy:
-        """Paper Eq. 8, undoing the embedding potential the solver already saw.
+        """Paper Eq. 8/1, undoing the embedding potential the solver already saw.
 
             E_solver = E_H[γ̃^A] + tr[γ̃^A (v_emb + P_B)]
 
-        so E_H[Ψ̃^A] is recovered by subtraction, and the Eq. 8 correction term
-        tr[(γ̃^A - γ^A) v_emb] is reported separately.  Summing the two shows the
-        γ̃^A v_emb contributions cancel, leaving -tr[γ^A v_emb] against the raw
-        solver energy -- a useful cross-check on the bookkeeping.
-
-        **Footing rebasing.**  The subtraction ``E_low(AB) - E_low(A) + E_high(A)``
-        only telescopes if ``E_high(A)`` and ``E_low(A)`` reference the *same*
-        one-electron operator.  They do not by default: ``E_high(A)`` inherits the
-        **full-supersystem** ``h_core`` / ``energy_nuc`` from the downfolded
-        Hamiltonian's ``e_core`` (all nuclei), whereas EmbASI computes
-        ``subsys_A_lowlvl_totalen`` on its **ghosted subsystem-A** ``mol`` (only A's
-        nuclei; the environment atoms are basis ghosts).  Left uncorrected the two
-        A-terms sit ~4 Ha apart and the paper's Eq. 8 cancellation fails -- and
-        the outer loop still converges on the *density* while carrying that offset
-        in the *energy*, so density convergence alone never reveals it.  The shift
-        between the two references is a density-linear one-body quantity,
-        ``Δ = (E_nuc^full - E_nuc^A) + tr[γ̃^A (h_core^full - h_core^A)]`` (verified
-        density-independent in the 2-electron part -- same basis, same ERIs), so we
-        subtract it from ``e_high_A`` to land it on ``E_low(A)``'s footing.  What
-        remains after the shift is the genuine high-vs-low functional difference on
-        the fragment (WF-in-DFT), not the nuclear-frame artefact.
+        so E_H[Ψ̃^A] is recovered by subtraction, and the Eq. 8 first-order
+        correction term ``tr[(γ̃^A - γ^A) v_emb]`` is reported separately (written
+        here as its algebraically-simplified single-trace form, ``-tr[γ^A v_emb]``,
+        after the ``+tr[γ̃^A v_emb]`` pieces of the two terms cancel).
         """
         v_emb, p_b = self.v_emb, self.p_b
         dm_hl = self.rdm1_ao(result.rdm1, orbitals)
 
         leak = float(np.einsum("ij,ji->", dm_hl, p_b))
-        e_high_a = float(result.energy) - np.einsum("ij,ji->", dm_hl, v_emb) - leak
+        e_high_a = float(result.energy) - float(np.einsum("ij,ji->", dm_hl, v_emb)) - leak
         correction = float(np.einsum("ij,ji->", dm_hl - self._dm_a_arr_init, v_emb))
 
-        # Rebase e_high_A onto E_low(A)'s (ghosted subsystem-A) nuclear footing.
-        hcore_a, enuc_a = self._a_fragment_footing()
-        footing_shift = float(
-            (self.ints.energy_nuc() - enuc_a)
-            + np.einsum("ij,ji->", dm_hl, self.ints.hcore() - hcore_a)
-        )
-        e_high_a -= footing_shift
-
-        e_low_ab, e_low_a = self._low_level_energies()
+        e_low_ab, _ = self._low_level_energies()
+        e_low_a = self.e_a_init
         return ProjectionEnergy(
             e_low_total=e_low_ab,
             e_low_A=e_low_a,
             e_high_A=float(e_high_a),
             correction=correction,
             projector_leak=leak,
-            footing_shift=footing_shift,
+            footing_shift=0.0,
         )
 
     # ---------------- DFT-in-DFT (reference path, no solver) ---------------- #
@@ -1081,10 +1141,10 @@ class ProjectionEmbeddingAdapter:
 
         * **No footing rebase.**  ``DFT_AinB_total_energy`` telescopes on EmbASI's own
           internally-consistent frame -- ``subsys_A_highlvl_totalen`` and
-          ``subsys_A_lowlvl_totalen`` are both on the ghosted subsystem-A ``mol`` --
-          so the ``E_high(A)``-onto-``E_low(A)`` nuclear rebase the WF path needs
-          (:meth:`_a_fragment_footing`) does **not** apply here; ``footing_shift`` is
-          exactly ``0``.
+          ``subsys_A_lowlvl_totalen`` are both on the ghosted subsystem-A ``mol``.
+          The WF path no longer needs a rebase either (:meth:`projection_energy` now
+          computes ``E_low(A)`` on the same unghosted frame as ``e_core`` directly via
+          :meth:`AOIntegrals.energy_low`); ``footing_shift`` is always ``0`` now.
         * **PB projector term is included.**  ``PB_corr = tr[P_B γ̃^A]`` is folded into
           ``e_high_A`` (it is the projector-leak energy of the A high-level term) and
           also reported as ``projector_leak``.  The WF ``projection_energy`` subtracts
@@ -1133,62 +1193,6 @@ class ProjectionEmbeddingAdapter:
             footing_shift=0.0,  # native frame is self-consistent; no rebase
         )
 
-    def _a_fragment_footing(self) -> tuple[np.ndarray, float]:
-        """(h_core^A, E_nuc^A) of EmbASI's *ghosted subsystem-A* reference.
-
-        These are the one-electron operator and nuclear repulsion EmbASI used to
-        build ``subsys_A_lowlvl_totalen`` (:meth:`_low_level_energies`): its
-        ``A_LL`` layer runs on a ``mol`` where only subsystem-A atoms carry nuclei
-        and the environment atoms are basis *ghosts* (basis functions, no charge).
-        ``E_high(A)`` must be rebased onto exactly this footing before the Eq. 8
-        subtraction (see :meth:`projection_energy`).  This is the **WF-in-DFT path
-        only**: the DFT-in-DFT path reads EmbASI's native ``DFT_AinB_total_energy``,
-        which telescopes on EmbASI's own frame and needs no rebase (:meth:`dft_in_dft_energy`).
-
-        We read the operators *directly* off EmbASI's ``A_LL`` ``mol`` (the same
-        object it integrated), not by reconstructing them from a subtraction of
-        exposed matrices -- ``A_LL.hamiltonian_estat_plus_xc`` bundles the nuclear
-        attraction together with Coulomb+xc, so h_core^A is not separable from
-        what EmbASI exports.  ``int1e_kin + int1e_nuc`` on that ``mol`` reproduces
-        ``subsys_A_lowlvl_totalen`` to ~1e-14 Ha (asserted in the tests), and its
-        overlap matches ``self._s`` bit-for-bit (same basis, same AO ordering).
-
-        TODO(embasi-api): this reach-through is physically unavoidable for the WF
-        path against today's EmbASI.  The rebase needs ``h_core^A`` (a matrix) and the
-        scalar ``E_nuc^A``, and EmbASI exposes neither cleanly nor lets them be
-        reconstructed: ``hamiltonian_estat_plus_xc`` fuses nuclear attraction with the
-        density-dependent Coulomb+xc, and ``subsys_A_lowlvl_totalen`` is one scalar
-        (carrying ``tr[γ^A h_core^A]``, not the ``tr[γ̃ h_core^A]`` this contracts).
-        ``subsys_A_highlvl_totalen`` cannot substitute either -- on the WF path the
-        high level is HF + an external correlated solver, so EmbASI's value is only
-        the *mean-field* HF-in-DFT reference (and is the *embedded* energy, carrying
-        ``v_emb``/``P_B``), not the bare correlated ``E_high(A)`` the assembly needs.
-        Absent an EmbASI-native A-fragment footing, we reach through
-        ``A_LL.atoms.calc.mol`` to a PySCF ``Mole`` -- fine for PySCF, but there is no
-        equivalent for the FHI-aims/ASI backend, so the WF-path rebase is PySCF-only.
-        A backend-agnostic A-fragment ``h_core`` / ``energy_nuc`` on EmbASI would
-        remove the reach-through entirely.
-        """
-        try:
-            mol_a = self.p.A_LL.atoms.calc.mol
-            hcore_a = np.asarray(mol_a.intor("int1e_kin") + mol_a.intor("int1e_nuc"))
-            enuc_a = float(mol_a.energy_nuc())
-        except AttributeError as exc:  # pragma: no cover - non-PySCF / upstream change
-            raise AttributeError(
-                "cannot reach EmbASI's subsystem-A (ghosted) mol via "
-                "A_LL.atoms.calc.mol to rebase E_high(A) onto E_low(A)'s nuclear "
-                "footing; the projection energy would be ~4 Ha off without it. "
-                "Expose subsys_A_highlvl_totalen or the A-fragment "
-                "h_core/energy_nuc upstream for a backend-agnostic fix."
-            ) from exc
-        if hcore_a.shape != self._s_arr.shape:
-            raise ValueError(
-                f"subsystem-A h_core is {hcore_a.shape} but the supersystem basis "
-                f"is {self._s_arr.shape}; the ghosted A mol and F_emb are on different "
-                "bases (basis truncation not yet mapped, see run_low_level TODO)"
-            )
-        return hcore_a, enuc_a
-
     def _low_level_energies(self) -> tuple[float, float]:
         """(E_low(AB), E_low(A)) in Hartree, read from EmbASI internals.
 
@@ -1208,6 +1212,8 @@ class ProjectionEmbeddingAdapter:
         matrices), so take ``.real``.
         """
         try:
+            if not hasattr(self, "initial_ea"):
+                self.e_a_init = self.p.subsys_A_lowlvl_totalen * _EV2HA
             e_ab = self.p.subsys_AB_lowlvl_scftotalen
             e_a = self.p.subsys_A_lowlvl_totalen
         except AttributeError as exc:  # pragma: no cover - upstream rename guard
@@ -1217,7 +1223,7 @@ class ProjectionEmbeddingAdapter:
                 "construct_embedding_potential(); the projection energy cannot be "
                 "assembled (upstream attribute renamed?)"
             ) from exc
-        return float(np.real(e_ab)) * _EV2HA, float(np.real(e_a)) * _EV2HA
+        return e_ab * _EV2HA, e_a * _EV2HA
 
     # ---------------- density feedback ---------------- #
     def rdm1_ao(self, rdm1_active: np.ndarray, orbitals: EmbeddedOrbitals) -> np.ndarray:

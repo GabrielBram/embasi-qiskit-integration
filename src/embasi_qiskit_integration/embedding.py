@@ -141,6 +141,15 @@ class EmbeddingWorkflow(BaseSettings):
     # solver never runs; the dissociation-energy driver overrides this per run.
     xc_hl: str = "HF"
     mu: float = 1.0e6  # level-shift parameter, paper Eq. 6
+    # WF-in-DFT only (inert under DFT-in-DFT): converge subsystem A's own HF
+    # problem on A_HL, self-consistently, in the frozen v_emb/P_B potential
+    # run_low_level() built -- ProjectionEmbeddingAdapter.relax_active_hf().
+    # Without this, build_orbitals() diagonalizes F_emb exactly once against
+    # A_LL's (xc_ll-level) density, so Brillouin's theorem does not hold for
+    # the orbitals FCI/SQD receives -- an orbital-relaxation error that a
+    # formally-exact active-space solve cannot recover. See
+    # ProjectionEmbeddingAdapter.relax_active_hf for the full rationale.
+    relax_hf: bool = False
 
     a_nmos: int | None = None # Fixes the number of electrons selected by SPADE
 
@@ -281,7 +290,12 @@ class EmbeddingWorkflow(BaseSettings):
         # WF-in-DFT only.  Collective on every rank: EmbASI's supersystem SCF,
         # SPADE/Pipek-Mezey localisation, and the embedded Fock all run in here.
         emb.run_low_level(a_nmos=self.a_nmos)
-        selector, virtual_localizer, orbital_builder = self._build_selector(emb, log=log)
+        if self.relax_hf:
+            log("   relaxing subsystem-A HF reference on A_HL (self-consistent, frozen v_emb/P_B)...")
+            emb.relax_active_hf()
+        selector, virtual_localizer, orbital_builder = self._build_selector(
+            emb, log=log, use_relaxed=self.relax_hf
+        )
         solver = self._build_solver()
         return self._run_outer_loop(
             emb, solver, selector, virtual_localizer, orbital_builder, rank=rank, log=log
@@ -393,6 +407,7 @@ class EmbeddingWorkflow(BaseSettings):
                     n_virtual=self.n_virtual,
                     selector=selector,
                     virtual_localizer=virtual_localizer,
+                    use_relaxed=self.relax_hf,
                 )
             log(f"   {orbitals}")
             if orbital_builder is not None:
@@ -595,7 +610,7 @@ class EmbeddingWorkflow(BaseSettings):
         # PySCFIntegrals wraps the *same* mf_hl object, so veff_hl undoes exactly
         # what EmbASI folded into F_emb, whether that is KS or HF.
         density_fit: bool | str = self.df_auxbasis or self.density_fit
-        integrals = PySCFIntegrals(mf_hl, density_fit=density_fit)
+        integrals = PySCFIntegrals(mf_hl, mf_ll, density_fit=density_fit)
         return ProjectionEmbeddingAdapter(projection, integrals, mu=self.mu)
 
     def _build_atoms(self) -> tuple[Any, int]:
@@ -615,8 +630,15 @@ class EmbeddingWorkflow(BaseSettings):
             atoms = atoms[: self.n_atoms]
         return atoms, self.charge or 0
 
-    def _build_selector(self, emb: ProjectionEmbeddingAdapter, *, log=None):
+    def _build_selector(self, emb: ProjectionEmbeddingAdapter, *, log=None, use_relaxed: bool = False):
         """Build the active-virtual shaping hook from ``self.selector``.
+
+        ``use_relaxed`` (mirrors :meth:`ProjectionEmbeddingAdapter.build_orbitals`'s
+        flag) selects the relaxed embedded-HF Fock from
+        :meth:`ProjectionEmbeddingAdapter.relax_active_hf` instead of the one-shot
+        low-level F_emb, for every branch below that reads a Fock eagerly
+        (``concentric-cl``, ``apc-concentric``) -- ``self.relax_hf`` gates both
+        whether :meth:`relax_active_hf` ran and this flag, so they always agree.
 
         Returns a ``(selector, virtual_localizer, orbital_builder)`` triple with at
         most one non-None (all ``None`` for the fixed ``--n_virtual`` cut):
@@ -690,10 +712,12 @@ class EmbeddingWorkflow(BaseSettings):
                 n_shells, max_size, fixed = self.n_shells, self.apc_max_size, self.apc_fixed
 
                 def _orbital_builder(
-                    emb, frag=frag_union, n_shells=n_shells, max_size=max_size, fixed=fixed
+                    emb, frag=frag_union, n_shells=n_shells, max_size=max_size, fixed=fixed,
+                    use_relaxed=use_relaxed,
                 ):
                     return emb.build_orbitals_apc_concentric(
-                        fragment_ao=frag, n_shells=n_shells, max_size=max_size, fixed=fixed
+                        fragment_ao=frag, n_shells=n_shells, max_size=max_size, fixed=fixed,
+                        use_relaxed=use_relaxed,
                     )
 
                 return None, None, _orbital_builder
@@ -711,7 +735,7 @@ class EmbeddingWorkflow(BaseSettings):
                 concentric_localization_selector(
                     overlap,
                     frag_union,
-                    emb._fock,
+                    emb._fock_relaxed_arr if use_relaxed else emb._fock,
                     n_shells=self.n_shells,
                     max_virtual=self.n_virtual,
                 ),
