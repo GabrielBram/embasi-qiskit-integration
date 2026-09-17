@@ -666,7 +666,7 @@ class EmbeddingWorkflow(BaseSettings):
         # PySCFIntegrals wraps the *same* mf_hl object, so veff_hl undoes exactly
         # what EmbASI folded into F_emb, whether that is KS or HF.
         density_fit: bool | str = self.df_auxbasis or self.density_fit
-        integrals = PySCFIntegrals(mf_hl, density_fit=density_fit)
+        integrals = PySCFIntegrals(mf_hl, mf_ll, density_fit=density_fit)
         return ProjectionEmbeddingAdapter(
             projection, integrals, mu=self.mu, unrestricted=self.unrestricted
         )

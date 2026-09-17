@@ -1131,17 +1131,15 @@ class ProjectionEmbeddingAdapter:
             apc_orbital_entropies,
             apc_pair_coefficients,
             concentric_localization_selector,
+            somo_occupation_pattern,
         )
 
         fock = self._fock_relaxed_arr if use_relaxed else self._fock_arr
         cl = concentric_localization_selector(
-            self._s_arr, fragment_ao, fock, n_shells=n_shells
-        )
+            self._s_arr, fragment_ao, fock, n_shells=n_shells)
         orbitals = self.build_orbitals(
             n_frozen_occ=0, virtual_localizer=cl, restrict_to_a=restrict_to_a,
-            use_relaxed=use_relaxed,
-            somo_occupation_pattern,
-        )
+            use_relaxed=use_relaxed,)
 
         c_full = orbitals.coeff  # (nao, n_A): every subsystem-A orbital, occ + virt
         n_orb = c_full.shape[1]
