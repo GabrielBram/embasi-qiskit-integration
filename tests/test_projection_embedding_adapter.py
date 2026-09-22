@@ -68,7 +68,7 @@ def _build_adapter(xc_hl: str = "PBE", xc_ll: str = "PBE"):
         projection="level-shift",
         parallel=False,
     )
-    return ProjectionEmbeddingAdapter(projection, PySCFIntegrals(mf_hl), mu=1.0e6)
+    return ProjectionEmbeddingAdapter(projection, PySCFIntegrals(mf_hl, mf_ll), mu=1.0e6)
 
 
 @pytest.fixture(scope="module")
@@ -468,8 +468,8 @@ def test_density_fit_eri_matches_dense(adapter, orbitals_full):
     c_act = orbitals_full.c_active
     dense = adapter.ints.eri_mo(c_act)
 
-    # Same mf_hl, but DF-backed integrals (PySCF default auxbasis).
-    df_ints = PySCFIntegrals(adapter.ints.mf, density_fit=True)
+    # Same mf_hl/mf_ll, but DF-backed integrals (PySCF default auxbasis).
+    df_ints = PySCFIntegrals(adapter.ints.mf, adapter.ints.mf_ll, density_fit=True)
     fitted = df_ints.eri_mo(c_act)
 
     assert fitted.shape == dense.shape
