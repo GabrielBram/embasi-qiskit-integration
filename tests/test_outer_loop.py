@@ -189,7 +189,7 @@ def _build_adapter(n_occ_a: int = 1, mu: float = 1.0e6):
     mol = pyscf.M(atom="H 0 0 0; H 0 0 0.74; H 0 0 1.48; H 0 0 2.22", basis="sto-3g")
     mf_hl = mol.RHF()
     mock = _FeedbackMockEmbedding(mol, mu=mu, n_occ_a=n_occ_a)
-    return ProjectionEmbeddingAdapter(mock, PySCFIntegrals(mf_hl), mu=mu)
+    return ProjectionEmbeddingAdapter(mock, PySCFIntegrals(mf_hl, mf_hl), mu=mu)
 
 
 def _workflow(**overrides):
@@ -326,7 +326,8 @@ def test_feedback_propagates_the_two_densities_separately():
 
     mol = pyscf.M(atom="H 0 0 0; H 0 0 0.74; H 0 0 1.48; H 0 0 2.22", basis="sto-3g")
     mock = _FeedbackMockEmbedding(mol, mu=1.0e6, n_occ_a=1)
-    adapter = _RecordingAdapter(mock, PySCFIntegrals(mol.RHF()), mu=1.0e6)
+    mf_hl = mol.RHF()
+    adapter = _RecordingAdapter(mock, PySCFIntegrals(mf_hl, mf_hl), mu=1.0e6)
     adapter.run_low_level()
     dm_b = mock._dm_b.copy()
 
@@ -373,7 +374,8 @@ def test_mix_alpha_damps_the_fed_back_density():
     def build(alpha):
         mol = pyscf.M(atom="H 0 0 0; H 0 0 0.74; H 0 0 1.48; H 0 0 2.22", basis="sto-3g")
         mock = _FeedbackMockEmbedding(mol, mu=1.0e6, n_occ_a=1)
-        adapter = _RecordingAdapter(mock, PySCFIntegrals(mol.RHF()), mu=1.0e6)
+        mf_hl = mol.RHF()
+        adapter = _RecordingAdapter(mock, PySCFIntegrals(mf_hl, mf_hl), mu=1.0e6)
         adapter.run_low_level()
         seen.clear()
         wf = _workflow(

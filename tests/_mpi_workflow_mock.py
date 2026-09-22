@@ -151,7 +151,7 @@ def main() -> None:
         log("running under MPI with 2 ranks")
 
     mock = _MockProjectionEmbedding(mol, mu=1.0e6, n_occ_a=1)
-    adapter = ProjectionEmbeddingAdapter(mock, PySCFIntegrals(mf_hl), mu=1.0e6)
+    adapter = ProjectionEmbeddingAdapter(mock, PySCFIntegrals(mf_hl, mf_hl), mu=1.0e6)
 
     adapter.run_low_level()  # collective on every rank, mirrors the real flow
     orbitals = adapter.build_orbitals(n_frozen_occ=0, n_virtual=None)
